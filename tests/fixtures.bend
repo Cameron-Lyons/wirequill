@@ -11,15 +11,24 @@ def common() -> String:
     "enum State { UNKNOWN = 0; ENABLED = 1; NEGATIVE = -1; }"
   ], "\n") ++ "\n"
 
+def field_options() -> String:
+  String.join([
+    "syntax = \"proto2\";",
+    "package annotations;",
+    "import \"google/protobuf/descriptor.proto\";",
+    "extend google.protobuf.FieldOptions { optional string hint = 51001; }"
+  ], "\n") ++ "\n"
+
 def item_schema() -> String:
   String.join([
     "syntax = \"proto3\";",
     "package sample;",
     "import \"common.proto\";",
+    "import \"field_options.proto\";",
     "",
     "message Item {",
     "  message Metadata { fixed32 checksum = 1; }",
-    "  optional uint32 count = 1;",
+    "  optional uint32 count = 1 [(annotations.hint) = \"cardinality\"];",
     "  repeated sint32 deltas = 2;",
     "  sample.types.Label label = 3;",
     "  bytes payload = 4;",
@@ -43,6 +52,8 @@ def echo() -> String:
     "service Echo {",
     "  rpc Say(Value) returns (Value);",
     "  rpc List(Value) returns (stream Value);",
+    "  rpc Collect(stream Value) returns (Value);",
+    "  rpc Chat(stream Value) returns (stream Value);",
     "}"
   ], "\n") ++ "\n"
 
@@ -58,14 +69,10 @@ def tree() -> String:
     "    Node peer = 3;",
     "    uint32 id = 4;",
     "  }",
-    "}"
-  ], "\n") ++ "\n"
-
-def upload() -> String:
-  String.join([
-    "syntax = \"proto3\";",
-    "message Chunk {}",
-    "service Upload { rpc Put(stream Chunk) returns (Chunk); }"
+    "}",
+    "message Envelope { Left value = 1; }",
+    "message Left { Right right = 1; }",
+    "message Right { Left left = 1; }"
   ], "\n") ++ "\n"
 
 def legacy() -> String:
@@ -100,10 +107,10 @@ def save(path: String, contents: String) -> IO(Unit):
 def write(+dir: String) -> IO(Unit):
   do IO<Unit>:
     save(dir ++ "/common.proto", common())
+    save(dir ++ "/field_options.proto", field_options())
     save(dir ++ "/fixture.proto", item_schema())
     save(dir ++ "/echo.proto", echo())
     save(dir ++ "/tree.proto", tree())
-    save(dir ++ "/upload.proto", upload())
     save(dir ++ "/old.proto", legacy())
     save(dir ++ "/item.textproto", item_text())
 

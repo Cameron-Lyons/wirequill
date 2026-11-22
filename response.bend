@@ -1,9 +1,6 @@
 import Base
 import bend-kit-protobuf@0.2.2.0/protobuf.bend as P
 
-type Output is Data:
-  Output{name: String, content: String}
-
 def byte_length(s: String, acc: U32) -> U32:
   match s:
     case SNil{}: acc
@@ -36,38 +33,62 @@ def utf8(f: File, text: String) -> IO(File):
     r : File & Result<&1, &1, U32 & String, Unit> <- File.write(f, text)
     wrote(r)
 
-# File.write emits UTF-8 directly. Only the tags and lengths need byte lists.
-def output(f: File, out: Output) -> IO(File):
-  Output{+name, +content} = out
-  +n = byte_length(name, 0)
-  +c = byte_length(content, 0)
-  +name_tag = length_prefix(10, n)
-  +text_tag = length_prefix(122, c)
-  size = U32.add(U32.add(n, c), U32.from_nat(Nat.add(List.length(&2, U32, name_tag), List.length(&2, U32, text_tag))))
-  header = List.append(&2, U32, length_prefix(122, size), name_tag)
+def ascii(s: String) -> List<&2, U32>:
+  match s:
+    case SNil{}: Nil{}
+    case SCon{Chr{n}, rest}: Con{n, ascii(rest)}
+
+# Generated filenames are ASCII. An omitted name appends this record to the
+# preceding file in the protoc response.
+def name_header(name: String) -> List<&2, U32>:
+  match name:
+    case "": Nil{}
+    case s:
+      +bytes = ascii(s)
+      length = U32.from_nat(List.length(&2, U32, bytes))
+      List.append(&2, U32, length_prefix(10, length), bytes)
+
+def chunk(f: File, name: String, content: String, +size: U32) -> IO(File):
+  +header = List.append(&2, U32, name_header(name), length_prefix(122, size))
+  record_size = U32.add(U32.from_nat(List.length(&2, U32, header)), size)
   do IO<File>:
-    a : File <- binary(f, header)
-    b : File <- utf8(a, name)
-    d : File <- binary(b, text_tag)
-    utf8(d, content)
+    next : File <- binary(f, List.append(&2, U32, length_prefix(122, record_size), header))
+    utf8(next, content)
 
-def files(xs: List<&2, Output>, f: File) -> IO(Unit):
+def joined(reversed: List<&2, String>) -> String:
+  match reversed:
+    case [text]: text
+    case parts: String.concat(List.reverse(&2, String, parts))
+
+def flush(f: File, name: String, parts: List<&2, String>, size: U32) -> IO(File):
+  match name parts:
+    case "" Nil{}: IO.pure(File, f)
+    case n xs: chunk(f, n, joined(xs), size)
+
+def batch(full: Bool, f: File, name: String, parts: List<&2, String>, size: U32,
+          more: File -> String -> List<&2, String> -> U32 -> IO(File)) -> IO(File):
+  match full:
+    case False{}: more(f, name, parts, size)
+    case True{}:
+      do IO<File>:
+        next : File <- chunk(f, name, joined(parts), size)
+        more(next, "", Nil{}, 0)
+
+# Render declarations on demand and batch them to amortize pipe writes.
+def chunks(xs: List<(Unit -> String)>, f: File, name: String, parts: List<&2, String>, size: U32) -> IO(File):
   match xs:
-    case Nil{}: File.close(f)
-    case Con{x, t}:
-      do IO<Unit>:
-        next : File <- output(f, x)
-        files(t, next)
+    case Nil{}: flush(f, name, parts, size)
+    case Con{render, tail}:
+      +text = render(Unit{})
+      +total = byte_length(text, size)
+      batch(U32.is_ge(total, 32768), f, name, Con{text, parts}, total,
+        file => n => ps => len => chunks(tail, file, n, ps, len))
 
-def write(result: Result<&2, &2, String, List<&2, Output>>, f: File) -> IO(Unit):
-  match result:
-    case Fail{+msg}:
-      do IO<Unit>:
-        a : File <- binary(f, length_prefix(10, byte_length(msg, 0)))
-        b : File <- utf8(a, msg)
-        File.close(b)
-    case Done{xs}:
-      do IO<Unit>:
-        # supported_features = FEATURE_PROTO3_OPTIONAL.
-        a : File <- binary(f, [16, 1])
-        files(xs, a)
+def file(f: File, name: String, +text: String) -> IO(File):
+  chunk(f, name, text, byte_length(text, 0))
+
+def error(f: File, +msg: String) -> IO(Unit):
+  do IO<Unit>:
+    a : File <- binary(f, length_prefix(10, byte_length(msg, 0)))
+    b : File <- utf8(a, msg)
+    File.close(b)

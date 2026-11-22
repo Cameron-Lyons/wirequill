@@ -1,4 +1,5 @@
 import Base
+import bend-kit-bytes@0.3.3.1/bytes.bend as B
 import ../runtime.bend as R
 
 def check(ok: Bool, description: String) -> IO(Unit):
@@ -38,6 +39,38 @@ def invalid_value(v: Maybe<&2, R.Value>) -> Bool:
     case Some{R.Invalid{}}: True{}
     case _: False{}
 
+def group_bytes(bytes: Maybe<&2, List<&2, U32>>) -> Bool:
+  match bytes:
+    case Some{[11, 19, 24, 42, 20, 12]}: True{}
+    case _: False{}
+
+def group_roundtrip(fs: Maybe<&2, List<&2, R.Field>>) -> Bool:
+  match fs:
+    case None{}: False{}
+    case Some{xs}: group_bytes(R.render_checked(xs))
+
+def same_bytes(xs: List<&2, U32>, ys: List<&2, U32>) -> Bool:
+  match xs ys:
+    case Nil{} Nil{}: True{}
+    case Con{x, xt} Con{y, yt}: U32.is_eq(x, y) && same_bytes(xt, yt)
+    case _ _: False{}
+
+def buffer_lengths(xs: List<&2, U32>, +sample: List<&2, U32>) -> Bool:
+  match xs:
+    case Nil{}: same_bytes(sample, R.from_buffer(R.to_buffer(sample)))
+    case Con{h, t}:
+      same_bytes(sample, R.from_buffer(R.to_buffer(sample))) && buffer_lengths(t, Con{h, sample})
+
+def two_words(xs: List<U32>) -> Bool:
+  match xs:
+    case [67305985, 255]: True{}
+    case _: False{}
+
+def buffer_layout(b: B.Bytes) -> Bool:
+  match b:
+    case B.Bytes{5, words}: two_words(Array.to_list(~U32, words))
+    case _: False{}
+
 def main() -> IO(Unit):
   mixed_wire : List<&2, U32> = [8, 1, 10, 4, 150, 1, 255, 1, 8, 2]
   packed = R.pack(0, [R.Var{0, 1}, R.Var{0, 150}])
@@ -45,12 +78,15 @@ def main() -> IO(Unit):
   merged = R.child(2, [R.Field{2, R.Blob{[8, 42]}}, R.Field{2, R.Blob{[16, 9]}}])
   malformed = R.child(2, [R.Field{2, R.Blob{[8]}}, R.Field{2, R.Blob{[42]}}])
   do IO<Unit>:
+    check(buffer_lengths([1, 2, 3, 4, 0, 255, 128, 1, 17], Nil{}), "byte-buffer conversion changed a partial or complete word")
+    check(buffer_layout(R.to_buffer([257, 2, 3, 4, 511])), "byte-buffer word layout, masking, or tail padding changed")
     check(mixed_ok(mixed(R.parse(mixed_wire))), "mixed packed and unpacked occurrences lost wire order")
     check(wire_ok(encoded), "packed varints or little-endian -0.0 encoded incorrectly")
     check(scalar_ok(R.get_sint64(R.put_sint64(R.Word64{2147483648, 0})), R.get_float(R.W32{2147483648}), R.get_string(R.put_string("λ☔"))), "sint64, signed zero, or UTF-8 failed")
     check(merged_ok(merged), "singular embedded messages failed to merge")
     check(invalid_value(malformed), "truncated embedded message crossed an occurrence boundary")
     check(Maybe.is_none(&2, List<&2, R.Value>, mixed(R.parse([10, 1, 128]))), "accepted truncated packed varint")
+    check(group_roundtrip(R.parse([11, 19, 24, 42, 20, 12])), "nested unknown group contents changed during encoding")
     check(Maybe.is_none(&2, List<&2, R.Field>, R.parse([11, 20])), "accepted mismatched group delimiter")
     check(Maybe.is_none(&2, List<&2, R.Field>, R.parse([256])), "accepted non-byte input")
     check(Maybe.is_none(&2, String, R.get_string(R.Blob{[237, 160, 128]})), "accepted UTF-8 encoding of surrogate")

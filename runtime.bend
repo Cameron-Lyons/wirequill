@@ -10,7 +10,7 @@ type Value is Data:
   Var{hi: U32, lo: U32}
   W64{hi: U32, lo: U32}
   Blob{bytes: List<&2, U32>}
-  Group{}
+  Group{fields: List<&2, Field>}
   W32{bits: U32}
   Invalid{}
 
@@ -22,47 +22,82 @@ def valid_bytes(xs: List<&2, U32>) -> Bool:
     case Nil{}: True{}
     case Con{h, t}: U32.is_le(h, 255) && valid_bytes(t)
 
-def fill_bytes(xs: List<&2, U32>, +index: U32, out: B.Bytes) -> B.Bytes:
+# bend-kit stores four little-endian bytes per word. Mask each input byte
+# as B.set does and leave unused bytes of the final word zero.
+def pack_word(a: U32, b: U32, c: U32, d: U32) -> U32:
+  ((a .&. 255) .|. ((b .&. 255) << 8n) .|. ((c .&. 255) << 16n) .|. (d << 24n) : U32)
+
+def fill_words(xs: List<&2, U32>, +index: U32, buf: Array<U32>) -> Array<U32>:
   match xs:
-    case Nil{}: out
-    case Con{h, t}: fill_bytes(t, U32.add(index, 1), B.set(out, index, h))
+    case Nil{}: buf
+    case [a]: Array.set(U32, buf, index, pack_word(a, 0, 0, 0))
+    case [a, b]: Array.set(U32, buf, index, pack_word(a, b, 0, 0))
+    case [a, b, c]: Array.set(U32, buf, index, pack_word(a, b, c, 0))
+    case a <> b <> c <> d <> rest:
+      fill_words(rest, U32.add(index, 1), Array.set(U32, buf, index, pack_word(a, b, c, d)))
 
 def to_buffer(+xs: List<&2, U32>) -> B.Bytes:
-  fill_bytes(xs, 0, B.new(U32.from_nat(List.length(&2, U32, xs))))
+  +n = U32.from_nat(List.length(&2, U32, xs))
+  B.Bytes{n, fill_words(xs, 0, B.alloc(n))}
 
-def drain_step(r: B.Cursor & Maybe<&2, U32>, acc: List<&2, U32>, more: B.Cursor -> List<&2, U32> -> List<&2, U32>) -> List<&2, U32>:
-  (c, byte) = r
-  more(c, Con{Maybe.default(&2, U32, byte, 0), acc})
+def prepend_lanes(count: U32, a: U32, b: U32, c: U32, d: U32, rest: List<&2, U32>) -> List<&2, U32>:
+  match count:
+    case 1: a <> rest
+    case 2: a <> b <> rest
+    case 3: a <> b <> c <> rest
+    case _: a <> b <> c <> d <> rest
 
-def drain_bytes(n: Nat, c: B.Cursor, acc: List<&2, U32>) -> List<&2, U32>:
-  match n:
-    case 0n: List.reverse(&2, U32, acc)
-    case 1n+p:
-      drain_step(B.Cursor.u8(c), acc, next => result => drain_bytes(p, next, result))
+def prepend_bytes(count: U32, +w: U32, rest: List<&2, U32>) -> List<&2, U32>:
+  a = (w .&. 255 : U32)
+  b = ((w >> 8n) .&. 255 : U32)
+  c = ((w >> 16n) .&. 255 : U32)
+  d = (w >> 24n : U32)
+  prepend_lanes(count, a, b, c, d, rest)
+
+# Read backwards so prefixing each word directly builds the final wire order.
+def drain_words(remaining: Nat, index: U32, count: U32, read: Array<U32> & U32, acc: List<&2, U32>) -> List<&2, U32>:
+  match remaining read:
+    case 0n Tuple{buf, word}: prepend_bytes(count, word, acc)
+    case 1n+p Tuple{buf, word}:
+      +previous = U32.sub(index, 1)
+      drain_words(p, previous, 4, Array.get(U32, buf, previous), prepend_bytes(count, word, acc))
 
 def from_buffer(b: B.Bytes) -> List<&2, U32>:
-  B.Bytes{+n, buf} = b
-  drain_bytes(U32.to_nat(n), B.Cursor.new(B.Bytes{n, buf}), Nil{})
+  match b:
+    case B.Bytes{0, _}: Nil{}
+    case B.Bytes{n, buf}:
+      +last = U32.sub(n, 1)
+      +index = U32.shrn(last, 2n)
+      count = U32.add(U32.and(last, 3), 1)
+      drain_words(U32.to_nat(index), index, count, Array.get(U32, buf, index), Nil{})
 
-# The wire parser has already validated and consumed any obsolete group.
-# Groups never match proto3 schema fields.
-def from_wire(v: P.Value) -> Value:
+# Scalar conversions are also used by the packed-field helpers.
+def from_scalar(v: P.Value) -> Value:
   match v:
     case P.Varint{P.Word64{h, l}}: Var{h, l}
     case P.Fixed64{P.Word64{h, l}}: W64{h, l}
     case P.Blob{b}: Blob{from_buffer(b)}
-    case P.Group{xs}: Group{}
+    case P.Group{xs}: Invalid{}
     case P.Fixed32{w}: W32{w}
 
-def from_fields(xs: List<&1, P.Field>) -> List<&2, Field>:
-  match xs:
-    case Nil{}: Nil{}
-    case Con{P.Field{n, v}, t}: Con{Field{n, from_wire(v)}, from_fields(t)}
+# The upstream parser caps group depth at 100. The same bound keeps the
+# conversions total while preserving the contents of unknown legacy groups.
+def from_fields_at(+depth: Nat, xs: List<&1, P.Field>) -> List<&2, Field>:
+  match depth xs:
+    case d Nil{}: Nil{}
+    case 1n+p Con{P.Field{n, P.Group{inner}}, t}:
+      Con{Field{n, Group{from_fields_at(p, inner)}}, from_fields_at(depth, t)}
+    case d Con{P.Field{n, v}, t}: Con{Field{n, from_scalar(v)}, from_fields_at(depth, t)}
+
+def from_wire(v: P.Value) -> Value:
+  match v:
+    case P.Group{xs}: Group{from_fields_at(99n, xs)}
+    case other: from_scalar(other)
 
 def parsed(r: Result<&2, &1, P.Error, List<&1, P.Field>>) -> Maybe<&2, List<&2, Field>>:
   match r:
     case Fail{e}: None{}
-    case Done{xs}: Some{from_fields(xs)}
+    case Done{xs}: Some{from_fields_at(100n, xs)}
 
 def parse_valid(ok: Bool, xs: List<&2, U32>) -> Maybe<&2, List<&2, Field>>:
   match ok:
@@ -77,7 +112,7 @@ def wire_blob(ok: Bool, xs: List<&2, U32>) -> Maybe<&1, P.Value>:
     case False{}: None{}
     case True{}: Some{P.Blob{to_buffer(xs)}}
 
-def to_wire(v: Value) -> Maybe<&1, P.Value>:
+def to_scalar(v: Value) -> Maybe<&1, P.Value>:
   match v:
     case Var{h, l}: Some{P.Varint{P.Word64{h, l}}}
     case W64{h, l}: Some{P.Fixed64{P.Word64{h, l}}}
@@ -85,13 +120,18 @@ def to_wire(v: Value) -> Maybe<&1, P.Value>:
     case W32{w}: Some{P.Fixed32{w}}
     case _: None{}
 
-def to_fields(xs: List<&2, Field>) -> Maybe<&1, List<&1, P.Field>>:
-  match xs:
-    case Nil{}: Some{Nil{}}
-    case Con{Field{n, v}, t}:
+def to_fields_at(+depth: Nat, xs: List<&2, Field>) -> Maybe<&1, List<&1, P.Field>>:
+  match depth xs:
+    case d Nil{}: Some{Nil{}}
+    case 1n+p Con{Field{n, Group{inner}}, t}:
       do Maybe<&1, List<&1, P.Field>>:
-        w : P.Value <- to_wire(v)
-        tail : List<&1, P.Field> <- to_fields(t)
+        group : List<&1, P.Field> <- to_fields_at(p, inner)
+        tail : List<&1, P.Field> <- to_fields_at(depth, t)
+        return Con{P.Field{n, P.Group{group}}, tail}
+    case d Con{Field{n, v}, t}:
+      do Maybe<&1, List<&1, P.Field>>:
+        w : P.Value <- to_scalar(v)
+        tail : List<&1, P.Field> <- to_fields_at(depth, t)
         return Con{P.Field{n, w}, tail}
 
 def encoded(r: Result<&2, &1, P.Error, B.Bytes>) -> Maybe<&2, List<&2, U32>>:
@@ -105,14 +145,14 @@ def render_fields(r: Maybe<&1, List<&1, P.Field>>) -> Maybe<&2, List<&2, U32>>:
     case Some{xs}: encoded(P.encode(xs, 2147483647, 100n))
 
 def render_checked(xs: List<&2, Field>) -> Maybe<&2, List<&2, U32>>:
-  render_fields(to_fields(xs))
+  render_fields(to_fields_at(100n, xs))
 
 def wire_kind(v: Value) -> U32:
   match v:
     case Var{h, l}: 0
     case W64{h, l}: 1
     case Blob{b}: 2
-    case Group{}: 3
+    case Group{fs}: 3
     case W32{w}: 5
     case Invalid{}: 7
 
@@ -164,7 +204,7 @@ def read_many(number: U32, kind: U32, fields: List<&2, Field>) -> Maybe<&2, List
 def packed_wire(ok: Bool, v: Value) -> Maybe<&1, P.Value>:
   match ok:
     case False{}: None{}
-    case True{}: to_wire(v)
+    case True{}: to_scalar(v)
 
 def to_packed(xs: List<&2, Value>, +kind: U32) -> Maybe<&1, List<&1, P.Value>>:
   match xs:

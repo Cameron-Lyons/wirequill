@@ -26,8 +26,15 @@ def finish(ok: Bool) -> IO(Unit):
     case True{}: IO.pure(Unit, Unit{})
     case False{}: IO.die(Unit, 1, "recursive message or oneof handling failed")
 
+def mutual(result: Maybe<&2, S.PB_tree_Envelope>) -> Bool:
+  match result:
+    case Some{S.PB_tree_Envelope{Some{S.PB_tree_Left{Some{S.PB_tree_Right{Some{S.PB_tree_Left{None{}}}}}}}}}: True{}
+    case _: False{}
+
 def main() -> IO(Unit):
   # The first peer is cleared by the id and must not merge into the later peer.
   wire : List<&2, U32> = [18, 3, 10, 1, 88, 26, 3, 10, 1, 89, 32, 9, 26, 2, 32, 7]
   corrupt : List<&2, U32> = [26, 3, 10, 1, 255, 32, 9]
-  finish(roundtrip(S.PB_tree_Node.decode(wire)) && Maybe.is_none(&2, S.PB_tree_Node, S.PB_tree_Node.decode(corrupt)))
+  do IO<Unit>:
+    finish(roundtrip(S.PB_tree_Node.decode(wire)) && Maybe.is_none(&2, S.PB_tree_Node, S.PB_tree_Node.decode(corrupt)))
+    finish(mutual(S.PB_tree_Envelope.decode([10, 4, 10, 2, 10, 0])))
