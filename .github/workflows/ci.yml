@@ -1,0 +1,61 @@
+name: Wirequill CI
+
+on:
+  pull_request:
+  push:
+    branches: [main, master]
+  merge_group:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  verify:
+    name: Verify Wirequill
+    runs-on: ubuntu-26.04
+    timeout-minutes: 15
+    env:
+      CC: clang-23
+      BEND_NO_TELEMETRY: '1'
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install Clang from LLVM's stable 23 channel
+        working-directory: ${{ runner.temp }}
+        run: |
+          curl -fsSL --retry 3 -o llvm.asc https://apt.llvm.org/llvm-snapshot.gpg.key
+          echo '8b2a587ffd672c4687e7581dad4b2f6c1bb2ad6b480cd9771ba2ff48e0b8c75d  llvm.asc' | sha256sum --check --strict
+          sudo install -m 0644 llvm.asc /etc/apt/keyrings/llvm.asc
+          echo 'deb [signed-by=/etc/apt/keyrings/llvm.asc] https://apt.llvm.org/resolute/ llvm-toolchain-resolute-23 main' \
+            | sudo tee /etc/apt/sources.list.d/llvm-23.list > /dev/null
+          sudo apt-get -o Acquire::Retries=3 update
+          sudo apt-get install -y --no-install-recommends clang-23
+          "$CC" --version
+
+      - name: Install pinned compilers
+        working-directory: ${{ runner.temp }}
+        shell: bash
+        env:
+          BEND_VERSION: '2.0.40'
+          BEND_SHA256: c9ff8d67bd903fb6ad9a26b43d8a62c01021de82a44d55ce4a3dcd4732113d6b
+          PROTOC_VERSION: '36.2'
+          PROTOC_SHA256: 121f6c7afe1d4d0e3ea6aab9432038599250134cbf4474cb1167d2c7decd4278
+        run: |
+          curl -fsSL --retry 3 -o bend.tar.gz "https://github.com/bendlang/bend/releases/download/v${BEND_VERSION}/bend-${BEND_VERSION}-linux-x64.tar.gz"
+          curl -fsSL --retry 3 -o protoc.zip "https://github.com/protocolbuffers/protobuf/releases/download/v${PROTOC_VERSION}/protoc-${PROTOC_VERSION}-linux-x86_64.zip"
+          printf '%s  %s\n' "$BEND_SHA256" bend.tar.gz "$PROTOC_SHA256" protoc.zip | sha256sum --check --strict
+          tar -xzf bend.tar.gz
+          unzip -q protoc.zip -d protoc
+          printf '%s\n' "$PWD/bend/bin" "$PWD/protoc/bin" >> "$GITHUB_PATH"
+
+      - name: Build, check and test
+        env:
+          BEND_HOME: ${{ runner.temp }}/bend
+        run: bend test.bend
