@@ -12,8 +12,7 @@ def main() -> IO(Unit):
     nonce : U32 <- IO.try(U32, IO.random_u32())
     +suffix : String = "." ++ U32.show(nonce)
     +assets : String = "build/assets" ++ suffix ++ ".bend"
-    source : String <- Embed.source()
-    Host.write_text(assets, source)
+    Embed.embed(assets)
     Host.command("mv", [assets, "build/assets.bend"])
     +binary : String = "build/wirequill" ++ suffix
     Host.command(compiler, ["main.bend", "-o", binary])

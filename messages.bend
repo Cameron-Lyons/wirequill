@@ -75,14 +75,20 @@ def convert(+kind: U32, target: String, +verb: String) -> String:
 # Slots bind the generated record label, type, default, and wire expressions
 # together so their order is identical in the type, encoder, and decoder.
 type Slot is Data:
-  Slot{label: String, ty: String, zero: String, read: String, write: String}
+  Slot{label: String, ty: String, zero: String, read: String, write: String, bucket: String}
+
+def field_bucket(num: String) -> String:
+  "U32.shln(" ++ num ++ ", 1n)"
+
+def oneof_bucket(i: U32) -> String:
+  U32.show(U32.add(U32.shln(i, 1n), 1))
 
 def singular_slot(optional: Bool, +n: String, +ty: String, +num: String, get: String, put: String, lookup: String, +d: String) -> Slot:
   match optional:
     case True{}:
-      Slot{n, "Maybe<&2, " ++ ty ++ ">", "None{}", "V.optional(~" ++ ty ++ ", ~" ++ get ++ ", " ++ lookup ++ ")", "V.emit_optional(~" ++ ty ++ ", ~" ++ put ++ ", " ++ num ++ ", " ++ n ++ ")"}
+      Slot{n, "Maybe<&2, " ++ ty ++ ">", "None{}", "V.optional(~" ++ ty ++ ", ~" ++ get ++ ", " ++ lookup ++ ")", "V.emit_optional(~" ++ ty ++ ", ~" ++ put ++ ", " ++ num ++ ", " ++ n ++ ")", field_bucket(num)}
     case False{}:
-      Slot{n, ty, d, "V.scalar(~" ++ ty ++ ", ~" ++ get ++ ", " ++ lookup ++ ", " ++ d ++ ")", "V.emit_scalar(" ++ num ++ ", " ++ put ++ "(" ++ n ++ "))"}
+      Slot{n, ty, d, "V.scalar(~" ++ ty ++ ", ~" ++ get ++ ", " ++ lookup ++ ", " ++ d ++ ")", "V.emit_scalar(" ++ num ++ ", " ++ put ++ "(" ++ n ++ "))", field_bucket(num)}
 
 def last_field(kind: U32, num: String, w: String) -> String:
   match kind:
@@ -104,13 +110,13 @@ def repeated_slot(is_map: Bool, +n: String, +num: String, +kind: U32, +target: S
       +ty = M.name(target)
       read = "Maybe.map(&2, List<&2, " ++ ty ++ ">, Map<&2, " ++ ty ++ ">, xs => V.to_map(~" ++ ty ++ ", ~" ++ ty ++ ".key, xs, MTip{}), V.many(~" ++ ty ++ ", ~" ++ ty ++ ".get, " ++ num ++ ", 2, fs))"
       write = many_write(False{}, ty, ty ++ ".put", num, "2", "Map.values(&2, " ++ ty ++ ", " ++ n ++ ")")
-      Slot{n, "Map<&2, " ++ ty ++ ">", "MTip{}", read, write}
+      Slot{n, "Map<&2, " ++ ty ++ ">", "MTip{}", read, write, field_bucket(num)}
     case False{}:
       +ty = bare(kind, target)
       +w = wire(kind)
       read = "V.many(~" ++ ty ++ ", ~" ++ convert(kind, target, "get") ++ ", " ++ num ++ ", " ++ w ++ ", fs)"
       write = many_write(packed, ty, convert(kind, target, "put"), num, w, n)
-      Slot{n, "List<&2, " ++ ty ++ ">", "Nil{}", read, write}
+      Slot{n, "List<&2, " ++ ty ++ ">", "Nil{}", read, write, field_bucket(num)}
 
 def field_slot(repeated: Bool, is_map: Bool, +n: String, +num: String, +kind: U32, +target: String, optional: Bool, packed: Bool) -> Slot:
   match repeated kind:
@@ -119,19 +125,19 @@ def field_slot(repeated: Bool, is_map: Bool, +n: String, +num: String, +kind: U3
       +ty = M.name(target)
       read = "V.optional(~" ++ ty ++ ", ~" ++ ty ++ ".get, R.child(" ++ num ++ ", fs))"
       write = "V.emit_optional(~" ++ ty ++ ", ~" ++ ty ++ ".put, " ++ num ++ ", " ++ n ++ ")"
-      Slot{n, "Maybe<&2, " ++ ty ++ ">", "None{}", read, write}
+      Slot{n, "Maybe<&2, " ++ ty ++ ">", "None{}", read, write, field_bucket(num)}
     case False{} k: scalar_slot(n, num, k, target, optional)
 
 def slot_decl(s: Slot) -> String:
-  Slot{n, t, _, _, _} = s
+  Slot{n, t, _, _, _, _} = s
   n ++ ": " ++ t
 
 def slot_name(s: Slot) -> String:
-  Slot{n, _, _, _, _} = s
+  Slot{n, _, _, _, _, _} = s
   n
 
 def slot_zero(s: Slot) -> String:
-  Slot{_, _, z, _, _} = s
+  Slot{_, _, z, _, _, _} = s
   z
 
 def join_slots(~show: Slot -> String, xs: List<&2, Slot>) -> String:
@@ -140,15 +146,21 @@ def join_slots(~show: Slot -> String, xs: List<&2, Slot>) -> String:
     case Con{h, Nil{}}: show(h)
     case Con{h, Con{hh, tt}}: show(h) ++ ", " ++ join_slots(~show, Con{hh, tt})
 
-def reads(xs: List<&2, Slot>) -> String:
+def read_bucket(indexed: Bool, key: String) -> String:
+  match indexed:
+    case True{}: "    fs : List<&2, R.Field> = V.bucket(index, " ++ key ++ ")\n"
+    case False{}: ""
+
+def reads(xs: List<&2, Slot>, +indexed: Bool) -> String:
   match xs:
     case Nil{}: ""
-    case Con{Slot{n, t, _, read, _}, rest}: "    " ++ n ++ " : " ++ t ++ " <- " ++ read ++ "\n" ++ reads(rest)
+    case Con{Slot{n, t, _, read, _, key}, rest}:
+      read_bucket(indexed, key) ++ "    " ++ n ++ " : " ++ t ++ " <- " ++ read ++ "\n" ++ reads(rest, indexed)
 
 def writes(reversed: List<&2, Slot>) -> String:
   match reversed:
     case Nil{}: ""
-    case Con{Slot{_, _, _, _, write}, rest}:
+    case Con{Slot{_, _, _, _, write, _}, rest}:
       "  out = List.append(&2, R.Field, " ++ write ++ ", out)\n" ++ writes(rest)
 
 def map_set(msgs: List<&2, M.Message>, acc: Set()) -> Set():
@@ -169,7 +181,7 @@ def map_value_field(map_entry: Bool, +number: U32, +kind: U32, n: String, +targe
       +ty = M.name(target)
       +name = "f_" ++ M.ident(n)
       read = "V.scalar(~" ++ ty ++ ", ~" ++ ty ++ ".get, R.child(2, fs), " ++ ty ++ ".default())"
-      Slot{name, ty, ty ++ ".default()", read, "[R.Field{2, " ++ ty ++ ".put(" ++ name ++ ")}]"}
+      Slot{name, ty, ty ++ ".default()", read, "[R.Field{2, " ++ ty ++ ".put(" ++ name ++ ")}]", field_bucket("2")}
     case _ _ _: field_slot(rep, entry, "f_" ++ M.ident(n), U32.show(number), kind, target, opt, packed)
 
 def fields(xs: List<&2, M.Field>, +maps: Set(), +map_entry: Bool) -> List<&2, Slot>:
@@ -191,13 +203,13 @@ def group_fields(xs: List<&2, M.Field>, +i: U32) -> List<&2, M.Field>:
 def choice_type(n: String, i: U32) -> String:
   "Oneof_" ++ U32.show(i) ++ "_" ++ n
 
-def choice_slot(members: List<&2, M.Field>, +n: String, +name: String, i: U32, rest: List<&2, Slot>) -> List<&2, Slot>:
+def choice_slot(members: List<&2, M.Field>, +n: String, +name: String, +i: U32, rest: List<&2, Slot>) -> List<&2, Slot>:
   match members:
     case Nil{}: rest
     case Con{_, _}:
       +ty = choice_type(n, i)
       +label = "o_" ++ M.ident(name)
-      Con{Slot{label, "Maybe<&2, " ++ ty ++ ">", "None{}", ty ++ ".read(fs)", ty ++ ".write(" ++ label ++ ")"}, rest}
+      Con{Slot{label, "Maybe<&2, " ++ ty ++ ">", "None{}", ty ++ ".read(fs)", ty ++ ".write(" ++ label ++ ")", oneof_bucket(i)}, rest}
 
 def choices(gs: List<&2, String>, +n: String, +xs: List<&2, M.Field>, +i: U32) -> List<&2, Slot>:
   match gs:
@@ -244,25 +256,27 @@ def choice_writes(ms: List<&2, M.Field>, +choice: String) -> String:
     case Con{M.Field{f, number, kind, target, _, _, _, _}, t}:
       "        case " ++ choice_con(choice, f) ++ "{v}: [R.Field{" ++ U32.show(number) ++ ", " ++ convert(kind, target, "put") ++ "(v)}]\n" ++ choice_writes(t, choice)
 
-def members(ms: List<&2, M.Field>) -> String:
-  match ms:
-    case Nil{}: "Nil{}"
-    case Con{M.Field{_, number, kind, _, _, _, _, _}, t}:
-      "Con{V.Member{" ++ U32.show(number) ++ ", " ++ wire(kind) ++ "}, " ++ members(t) ++ "}"
-
-def validate_member(kind: U32, +number: U32, +target: String) -> String:
+def validate_member(kind: U32, number: U32, +target: String) -> String:
   match kind:
-    case 9:
-      "    unused_" ++ U32.show(number) ++ " : List<&2, String> <- V.many(~String, ~R.get_string, " ++ U32.show(number) ++ ", 2, discarded)\n"
+    case 9: "    case " ++ U32.show(number) ++ ": Maybe.is_some(&2, String, R.get_string(v))\n"
     case 11:
       +ty = M.name(target)
-      "    unused_" ++ U32.show(number) ++ " : List<&2, " ++ ty ++ "> <- V.many(~" ++ ty ++ ", ~" ++ ty ++ ".get, " ++ U32.show(number) ++ ", 2, discarded)\n"
+      "    case " ++ U32.show(number) ++ ": Maybe.is_some(&2, " ++ ty ++ ", " ++ ty ++ ".get(v))\n"
     case _: ""
 
-def validate_discarded(ms: List<&2, M.Field>) -> String:
+def validate_cases(ms: List<&2, M.Field>) -> String:
   match ms:
     case Nil{}: ""
-    case Con{M.Field{_, num, k, target, _, _, _, _}, t}: validate_member(k, num, target) ++ validate_discarded(t)
+    case Con{M.Field{_, num, k, target, _, _, _, _}, t}: validate_member(k, num, target) ++ validate_cases(t)
+
+def choice_validation(cases: String, +ty: String, +opt: String) -> String:
+  match cases:
+    case SNil{}:
+      "def " ++ ty ++ ".validate(s: V.Choice) -> Maybe<&2, " ++ opt ++ ">:\n  V.Choice{n, fields, _} = s\n  " ++ ty ++ ".selected(n, fields)\n\n"
+    case SCon{h, t}:
+      valid = "def " ++ ty ++ ".valid(f: R.Field) -> Bool:\n  R.Field{n, v} = f\n  match n:\n" ++ SCon{h, t} ++ "    case _: True{}\n\n"
+      compact = "def " ++ ty ++ ".validate(s: V.Choice) -> Maybe<&2, " ++ opt ++ ">:\n  V.Choice{n, fields, discarded} = s\n  do Maybe<&2, " ++ opt ++ ">:\n    ok : Unit <- V.checked(List.all(~&2, ~R.Field, ~" ++ ty ++ ".valid, discarded))\n    " ++ ty ++ ".selected(n, fields)\n\n"
+      valid ++ compact
 
 def oneof_code(ms: List<&2, M.Field>, +ty: String) -> String:
   match ms:
@@ -271,8 +285,8 @@ def oneof_code(ms: List<&2, M.Field>, +ty: String) -> String:
       +xs = {Con{h, t} : List<&2, M.Field>}
       +opt = "Maybe<&2, " ++ ty ++ ">"
       read = "def " ++ ty ++ ".selected(n: U32, fs: List<&2, R.Field>) -> Maybe<&2, " ++ opt ++ ">:\n  match n:\n" ++ choice_reads(xs, ty)
-      validate = "def " ++ ty ++ ".validate(s: V.Choice) -> Maybe<&2, " ++ opt ++ ">:\n  V.Choice{number, rest, +discarded} = s\n  do Maybe<&2, " ++ opt ++ ">:\n" ++ validate_discarded(xs) ++ "    " ++ ty ++ ".selected(number, rest)\n\n"
-      pick = "def " ++ ty ++ ".read(fs: List<&2, R.Field>) -> Maybe<&2, " ++ opt ++ ">:\n  " ++ ty ++ ".validate(V.select(fs, " ++ members(xs) ++ ", V.Choice{0, Nil{}, Nil{}}))\n\n"
+      validate = choice_validation(validate_cases(xs), ty, opt)
+      pick = "def " ++ ty ++ ".read(fs: List<&2, R.Field>) -> Maybe<&2, " ++ opt ++ ">:\n  " ++ ty ++ ".validate(V.select_known(fs, V.Choice{0, Nil{}, Nil{}}))\n\n"
       write = "def " ++ ty ++ ".write(x: " ++ opt ++ ") -> List<&2, R.Field>:\n  match x:\n    case None{}: Nil{}\n    case Some{c}:\n      match c:\n" ++ choice_writes(xs, ty)
       read ++ validate ++ pick ++ write
 
@@ -281,13 +295,24 @@ def oneof_defs(gs: List<&2, String>, +n: String, +xs: List<&2, M.Field>, +i: U32
     case Nil{}: ""
     case Con{_, t}: oneof_code(group_fields(xs, i), choice_type(n, i)) ++ oneof_defs(t, n, xs, U32.add(i, 1))
 
-def message_decls(msgs: List<&2, M.Message>, +maps: Set()) -> String:
+def unknown_slot(preserve: Bool) -> List<&2, Slot>:
+  match preserve:
+    case False{}: Nil{}
+    case True{}: [Slot{"unknown_fields", "List<&2, R.Field>", "Nil{}", "Some{fs}", "unknown_fields", "0"}]
+
+def message_slots(+fs: List<&2, M.Field>, gs: List<&2, String>, name: String, maps: Set(), entry: Bool, preserve: Bool) -> List<&2, Slot>:
+  List.append(&2, Slot, fields(fs, maps, entry), List.append(&2, Slot, choices(gs, name, fs, 0), unknown_slot(preserve)))
+
+def message_decl(m: M.Message, maps: Set(), preserve: Bool) -> String:
+  M.Message{raw, +fs, +gs, entry} = m
+  +n = M.name(raw)
+  slots = message_slots(fs, gs, n, maps, entry, preserve)
+  oneof_decls(gs, n, fs, 0) ++ "type " ++ n ++ " is Data:\n  " ++ n ++ "{" ++ join_slots(~slot_decl, slots) ++ "}\n\n"
+
+def message_decls(msgs: List<&2, M.Message>, +maps: Set(), +preserve: Bool) -> List<(Unit -> String)>:
   match msgs:
-    case Nil{}: ""
-    case Con{M.Message{raw, +fs, +gs, map_entry}, t}:
-      +n = M.name(raw)
-      slots = List.append(&2, Slot, fields(fs, maps, map_entry), choices(gs, n, fs, 0))
-      oneof_decls(gs, n, fs, 0) ++ "type " ++ n ++ " is Data:\n  " ++ n ++ "{" ++ join_slots(~slot_decl, slots) ++ "}\n\n" ++ message_decls(t, maps)
+    case Nil{}: Nil{}
+    case Con{m, t}: Con{u => message_decl(m, maps, preserve), message_decls(t, maps, preserve)}
 
 # Each enum is an open numeric type. Named constants and unknown numbers
 # therefore take exactly the same round trip, including negative int32 values.
@@ -297,15 +322,18 @@ def constants(xs: List<&2, M.EnumValue>, +n: String) -> String:
     case Con{M.EnumValue{name, v}, t}:
       "def " ++ n ++ ".value_" ++ M.ident(name) ++ "() -> " ++ n ++ ":\n  " ++ n ++ "{" ++ U32.show(v) ++ "}\n\n" ++ constants(t, n)
 
-def enum_defs(es: List<&2, M.Enum>) -> String:
+def enum_def(e: M.Enum) -> String:
+  M.Enum{raw, vals} = e
+  +n = M.name(raw)
+  decl = "type " ++ n ++ " is Data:\n  " ++ n ++ "{number: U32}\n\n"
+  get = "def " ++ n ++ ".get(v: R.Value) -> Maybe<&2, " ++ n ++ ">:\n  Maybe.map(&2, U32, " ++ n ++ ", x => " ++ n ++ "{x}, R.get_int32(v))\n\n"
+  put = "def " ++ n ++ ".put(x: " ++ n ++ ") -> R.Value:\n  " ++ n ++ "{v} = x\n  R.put_int32(v)\n\n"
+  decl ++ constants(vals, n) ++ get ++ put
+
+def enum_defs(es: List<&2, M.Enum>) -> List<(Unit -> String)>:
   match es:
-    case Nil{}: ""
-    case Con{M.Enum{raw, vals}, t}:
-      +n = M.name(raw)
-      decl = "type " ++ n ++ " is Data:\n  " ++ n ++ "{number: U32}\n\n"
-      get = "def " ++ n ++ ".get(v: R.Value) -> Maybe<&2, " ++ n ++ ">:\n  Maybe.map(&2, U32, " ++ n ++ ", x => " ++ n ++ "{x}, R.get_int32(v))\n\n"
-      put = "def " ++ n ++ ".put(x: " ++ n ++ ") -> R.Value:\n  " ++ n ++ "{v} = x\n  R.put_int32(v)\n\n"
-      decl ++ constants(vals, n) ++ get ++ put ++ enum_defs(t)
+    case Nil{}: Nil{}
+    case Con{e, t}: Con{u => enum_def(e), enum_defs(t)}
 
 def key_code(k: U32, n: String) -> String:
   match k:
@@ -318,10 +346,10 @@ def key_code(k: U32, n: String) -> String:
     case 18: "V.word_key(" ++ n ++ ")"
     case _: "U32.show(" ++ n ++ ")"
 
-def map_key(entry: Bool, +n: String, xs: List<&2, M.Field>) -> String:
+def map_key(entry: Bool, +n: String, xs: List<&2, M.Field>, preserve: Bool) -> String:
   match entry xs:
     case True{} Con{M.Field{_, _, k, _, _, _, _, _}, _}:
-      "def " ++ n ++ ".key(entry: " ++ n ++ ") -> String:\n  " ++ n ++ "{key, _} = entry\n  " ++ key_code(k, "key") ++ "\n\n"
+      "def " ++ n ++ ".key(entry: " ++ n ++ ") -> String:\n  " ++ n ++ Bool.pick(String, preserve, "{key, _, _}", "{key, _}") ++ " = entry\n  " ++ key_code(k, "key") ++ "\n\n"
     case _ _: ""
 
 def adapters(+n: String, +prefix: String) -> String:
@@ -334,80 +362,154 @@ def trailing_adapters(cyclic: Bool, n: String) -> String:
     case True{}: ""
     case False{}: adapters(n, "")
 
-def init_message(include: Bool, +m: M.Message, maps: Set()) -> String:
-  match include:
-    case False{}: ""
-    case True{}:
-      M.Message{raw, +fs, +gs, +entry} = m
-      +n = M.name(raw)
-      slots = List.append(&2, Slot, fields(fs, maps, entry), choices(gs, n, fs, 0))
-      "def " ++ n ++ ".default() -> " ++ n ++ ":\n  " ++ n ++ "{" ++ join_slots(~slot_zero, slots) ++ "}\n\n" ++ map_key(entry, n, fs)
+def init_message(m: M.Message, maps: Set(), +preserve: Bool) -> String:
+  M.Message{raw, +fs, gs, +entry} = m
+  +n = M.name(raw)
+  slots = message_slots(fs, gs, n, maps, entry, preserve)
+  "def " ++ n ++ ".default() -> " ++ n ++ ":\n  " ++ n ++ "{" ++ join_slots(~slot_zero, slots) ++ "}\n\n" ++ map_key(entry, n, fs, preserve)
 
-def defaults(xs: List<&2, M.Message>, +maps: Set(), +entries: Bool) -> String:
+def default_chunk(include: Bool, m: M.Message, maps: Set(), preserve: Bool, rest: List<(Unit -> String)>) -> List<(Unit -> String)>:
+  match include:
+    case False{}: rest
+    case True{}: Con{u => init_message(m, maps, preserve), rest}
+
+def defaults(xs: List<&2, M.Message>, +maps: Set(), +entries: Bool, +preserve: Bool) -> List<(Unit -> String)>:
   match xs:
-    case Nil{}: ""
+    case Nil{}: Nil{}
     case Con{+m, t}:
       M.Message{_, _, _, entry} = m
-      init_message(U32.is_eq(Bool.to_u32(entry), Bool.to_u32(entries)), m, maps) ++ defaults(t, maps, entries)
+      default_chunk(U32.is_eq(Bool.to_u32(entry), Bool.to_u32(entries)), m, maps, preserve, defaults(t, maps, entries, preserve))
 
-def message_defs(m: M.Message, maps: Set(), +cyclic: Bool) -> String:
-  M.Message{raw, +fs, +gs, +map_entry} = m
+def route_bucket(group: Maybe<&2, U32>, number: String) -> String:
+  match group:
+    case None{}: field_bucket(number)
+    case Some{i}: oneof_bucket(i)
+
+def wire_test(repeated: Bool, w: String) -> String:
+  match repeated:
+    case True{}: "V.repeated_wire(" ++ w ++ ", wire)"
+    case False{}: "U32.is_eq(wire, " ++ w ++ ")"
+
+def route_cases(fs: List<&2, M.Field>) -> String:
+  match fs:
+    case Nil{}: "    case _: 0\n\n"
+    case Con{M.Field{_, num, k, _, rep, _, g, _}, t}:
+      +number = U32.show(num)
+      "    case " ++ number ++ ": Bool.pick(U32, " ++ wire_test(rep, wire(k)) ++ ", " ++ route_bucket(g, number) ++ ", 0)\n" ++ route_cases(t)
+
+def in_oneof(f: M.Field) -> Bool:
+  M.Field{_, _, _, _, _, _, group, _} = f
+  Maybe.is_some(&2, U32, group)
+
+# Small plain records decode faster with direct lookups. A shared index wins
+# for wider records and also supplies oneof ordering and the unknown-field bag.
+def need_index(slots: List<&2, Slot>, fields: List<&2, M.Field>, preserve: Bool) -> Bool:
+  wide = Bool.not(List.is_empty(&2, Slot, List.drop(&2, Slot, slots, 4n)))
+  preserve || wide || List.any(~&2, ~M.Field, ~in_oneof, fields)
+
+def classifier(indexed: Bool, name: String, fs: List<&2, M.Field>) -> String:
+  match indexed:
+    case False{}: ""
+    case True{}: "def " ++ name ++ ".bucket(number: U32, wire: U32) -> U32:\n  match number:\n" ++ route_cases(fs)
+
+def build_index(indexed: Bool, name: String, preserve: Bool) -> String:
+  match indexed:
+    case False{}: ""
+    case True{}: "    +index : V.FieldIndex = V.index(~" ++ name ++ ".bucket, " ++ Bool.pick(String, preserve, "True{}", "False{}") ++ ", fs)\n"
+
+def message_defs(m: M.Message, maps: Set(), cyclic: Bool, +preserve: Bool) -> String:
+  M.Message{raw, +fs, +gs, map_entry} = m
   +n = M.name(raw)
-  +slots = List.append(&2, Slot, fields(fs, maps, map_entry), choices(gs, n, fs, 0))
+  +slots = message_slots(fs, gs, n, maps, map_entry, preserve)
+  +indexed = need_index(slots, fs, preserve)
   +record = n ++ "{" ++ join_slots(~slot_name, slots) ++ "}"
-  read = "def " ++ n ++ ".decode(bytes: List<&2, U32>) -> Maybe<&2, " ++ n ++ ">:\n  do Maybe<&2, " ++ n ++ ">:\n    +fs : List<&2, R.Field> <- R.parse(bytes)\n" ++ reads(slots) ++ "    return " ++ record ++ "\n\n"
+  route = classifier(indexed, n, fs)
+  read = "def " ++ n ++ ".decode(bytes: List<&2, U32>) -> Maybe<&2, " ++ n ++ ">:\n  do Maybe<&2, " ++ n ++ ">:\n    +fs : List<&2, R.Field> <- R.parse(bytes)\n" ++ build_index(indexed, n, preserve) ++ reads(slots, indexed) ++ "    return " ++ record ++ "\n\n"
   write = "def " ++ n ++ ".encode_checked(x: " ++ n ++ ") -> Maybe<&2, List<&2, U32>>:\n  " ++ record ++ " = x\n  out : List<&2, R.Field> = Nil{}\n" ++ writes(List.reverse(&2, Slot, slots)) ++ "  R.render_checked(out)\n\n"
   encode = "def " ++ n ++ ".encode(x: " ++ n ++ ") -> Maybe<&2, List<&2, U32>>:\n  " ++ n ++ ".encode_checked(x)\n\n"
-  oneof_defs(gs, n, fs, 0) ++ read ++ write ++ encode ++ trailing_adapters(cyclic, n)
+  route ++ oneof_defs(gs, n, fs, 0) ++ read ++ write ++ encode ++ trailing_adapters(cyclic, n)
 
-# Bend checks definitions in declaration order. Emit dependencies first.
-def ready(fs: List<&2, M.Field>, +done: Set()) -> Bool:
-  match fs:
-    case Nil{}: True{}
-    case Con{M.Field{_, _, 11, target, _, _, _, _}, t}:
-      set_hit(Set.has(done, target)) && ready(t, done)
-    case Con{_, t}: ready(t, done)
+# Visit child types before emitting the codec that calls them. A reference to
+# an active ancestor needs a forward adapter. All other adapters can follow
+# their codec definitions, including users of a recursive type.
+type Visit is Data:
+  EnterType{name: String}
+  FinishType{message: M.Message}
 
-type Ordered is Data:
-  Ordered{ready: List<&2, M.Message>, pending: List<&2, M.Message>, seen: Set()}
+type Walk is Data:
+  Walk{todo: List<&2, Visit>, unvisited: Map<&2, M.Message>, active: Set(), forward: Set(), finished: List<&2, M.Message>}
 
-def msg_name(m: M.Message) -> String:
-  M.Message{name, _, _, _} = m
-  name
-
-def schedule(hit: Bool, +m: M.Message, xs: Ordered) -> Ordered:
-  match hit xs:
-    case True{} Ordered{yes, no, seen}:
-      Ordered{Con{m, yes}, no, Set.add(seen, msg_name(m))}
-    case False{} Ordered{yes, no, seen}: Ordered{yes, Con{m, no}, seen}
-
-def partition(xs: List<&2, M.Message>, +seen: Set()) -> Ordered:
+def visit_fields(xs: List<&2, M.Field>, rest: List<&2, Visit>) -> List<&2, Visit>:
   match xs:
-    case Nil{}: Ordered{Nil{}, Nil{}, seen}
+    case Nil{}: rest
+    case Con{M.Field{_, _, 11, name, _, _, _, _}, t}: Con{EnterType{name}, visit_fields(t, rest)}
+    case Con{_, t}: visit_fields(t, rest)
+
+def forward_if(active: Bool, names: Set(), target: String) -> Set():
+  match active:
+    case True{}: Set.add(names, target)
+    case False{}: names
+
+def enter(popped: Map<&2, M.Message> & Maybe<&2, M.Message>, +name: String, todo: List<&2, Visit>, +active: Set(), forward: Set(), finished: List<&2, M.Message>) -> Walk:
+  match popped:
+    case (remaining, Some{+m}):
+      M.Message{_, fields, _, _} = m
+      Walk{visit_fields(fields, Con{FinishType{m}, todo}), remaining, Set.add(active, name), forward, finished}
+    case (remaining, None{}):
+      back_edge = set_hit(Set.has(active, name))
+      Walk{todo, remaining, active, forward_if(back_edge, forward, name), finished}
+
+def walk_step(state: Walk) -> Walk:
+  match state:
+    case Walk{Con{EnterType{+name}, rest}, remaining, active, forward, finished}:
+      enter(Map.pop(&2, M.Message, remaining, name), name, rest, active, forward, finished)
+    case Walk{Con{FinishType{+m}, rest}, remaining, active, forward, finished}:
+      M.Message{name, _, _, _} = m
+      Walk{rest, remaining, Set.del(active, name), forward, Con{m, finished}}
+    case done: done
+
+def walk(fuel: Nat, state: Walk) -> Set() & List<&2, M.Message>:
+  match fuel state:
+    case 0n Walk{_, _, _, forward, finished}: (forward, List.reverse(&2, M.Message, finished))
+    case 1n+p Walk{Nil{}, _, _, forward, finished}: (forward, List.reverse(&2, M.Message, finished))
+    case 1n+p state: walk(p, walk_step(state))
+
+# Every root is entered once and every visited message adds one leave event
+# and at most one enter per field. This bounds the work even for mutual cycles.
+def order(xs: List<&2, M.Message>, remaining: Map<&2, M.Message>, roots: List<&2, Visit>, fuel: Nat) -> Set() & List<&2, M.Message>:
+  match xs:
+    case Nil{}: walk(fuel, Walk{List.reverse(&2, Visit, roots), remaining, Set.new(), Set.new(), Nil{}})
     case Con{+m, t}:
-      M.Message{_, fs, _, _} = m
-      schedule(ready(fs, seen), m, partition(t, seen))
+      M.Message{+name, fields, _, _} = m
+      budget = Nat.add(2n, List.length(&2, M.Field, fields))
+      order(t, Map.set(&2, M.Message, remaining, name, m), Con{EnterType{name}, roots}, Nat.add(budget, fuel))
 
-def definitions(xs: List<&2, M.Message>, +maps: Set(), +cyclic: Bool) -> String:
+def append_chunks(a: List<(Unit -> String)>, b: List<(Unit -> String)>) -> List<(Unit -> String)>:
+  List.append(&1, Unit -> String, a, b)
+
+def definitions(xs: List<&2, M.Message>, +forward: Set(), +maps: Set(), +preserve: Bool) -> List<(Unit -> String)>:
   match xs:
-    case Nil{}: ""
-    case Con{m, t}: message_defs(m, maps, cyclic) ++ definitions(t, maps, cyclic)
+    case Nil{}: Nil{}
+    case Con{+m, t}:
+      M.Message{name, _, _, _} = m
+      declared = set_hit(Set.has(forward, name))
+      Con{u => message_defs(m, maps, declared, preserve), definitions(t, forward, maps, preserve)}
 
-def cycle_adapters(xs: List<&2, M.Message>) -> String:
-  match xs:
-    case Nil{}: ""
-    case Con{M.Message{n, _, _, _}, t}: adapters(M.name(n), "@unsafe ") ++ cycle_adapters(t)
+def forward_adapters(names: List<&2, String>) -> List<(Unit -> String)>:
+  match names:
+    case Nil{}: Nil{}
+    case Con{n, t}: Con{u => adapters(M.name(n), "@unsafe "), forward_adapters(t)}
 
-def sorted_step(o: Ordered, +maps: Set(), next: List<&2, M.Message> -> Set() -> String) -> String:
-  match o:
-    case Ordered{Nil{}, +pending, _}: cycle_adapters(pending) ++ definitions(pending, maps, True{})
-    case Ordered{Con{h, t}, pending, seen}: definitions(Con{h, t}, maps, False{}) ++ next(pending, seen)
+def ordered_definitions(result: Set() & List<&2, M.Message>, maps: Set(), preserve: Bool) -> List<(Unit -> String)>:
+  (+forward, xs) = result
+  append_chunks(forward_adapters(Set.to_list(forward)), definitions(xs, forward, maps, preserve))
 
-def sorted(fuel: Nat, xs: List<&2, M.Message>, seen: Set(), +maps: Set()) -> String:
-  match fuel:
-    case 0n: ""
-    case 1n+p: sorted_step(partition(xs, seen), maps, rest => done => sorted(p, rest, done, maps))
-
-def emit(+msgs: List<&2, M.Message>, enums: List<&2, M.Enum>) -> String:
+# Keep each emission lazy. The plugin writes and releases each source fragment
+# as it goes, including when a request contains thousands of message types.
+def emit_chunks(+msgs: List<&2, M.Message>, enums: List<&2, M.Enum>, +preserve_unknown: Bool) -> List<(Unit -> String)>:
   +maps = map_set(msgs, Set.new())
-  enum_defs(enums) ++ message_decls(msgs, maps) ++ defaults(msgs, maps, False{}) ++ defaults(msgs, maps, True{}) ++ sorted(Succ{List.length(&2, M.Message, msgs)}, msgs, Set.new(), maps)
+  decls = message_decls(msgs, maps, preserve_unknown)
+  ordinary = defaults(msgs, maps, False{}, preserve_unknown)
+  entries = defaults(msgs, maps, True{}, preserve_unknown)
+  impls = ordered_definitions(order(msgs, MTip{}, Nil{}, 0n), maps, preserve_unknown)
+  append_chunks(enum_defs(enums), append_chunks(decls, append_chunks(ordinary, append_chunks(entries, impls))))

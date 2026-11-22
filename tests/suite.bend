@@ -86,25 +86,58 @@ def rejects(+protoc: String, args: List<String>, diagnostic: String) -> IO(Unit)
     status : U32 & (String & String) <- Host.run(protoc, args, "", 20000)
     check_failure(diagnostic, status)
 
+def reject_option(protoc: String, include: String, dest: String, option: String, diagnostic: String) -> IO(Unit):
+  rejects(protoc, ["--plugin=build/protoc-gen-proto", include, "--proto_opt=" ++ option, dest, "fixture.proto"], diagnostic)
+
 def negative(+protoc: String, +fixtures: String, +dir: String) -> IO(Unit):
   +include = "-I" ++ fixtures
+  +dest = "--proto_out=" ++ dir
   do IO<Unit>:
-    rejects(protoc, ["--plugin=build/protoc-gen-grpc", include, "--grpc_out=" ++ dir, "upload.proto"], "client streaming")
-    rejects(protoc, ["--plugin=build/protoc-gen-proto", include, "--proto_out=" ++ dir, "old.proto"], "Only proto3")
-    rejects(protoc, ["--plugin=build/protoc-gen-proto", include, "--proto_opt=bogus", "--proto_out=" ++ dir, "fixture.proto"], "generator parameters")
+    rejects(protoc, ["--plugin=build/protoc-gen-proto", include, dest, "old.proto"], "Only proto3")
+    reject_option(protoc, include, dest, "bogus", "Unknown generator parameter")
+    reject_option(protoc, include, dest, "module=../escape", "single identifier")
+    reject_option(protoc, include, dest, "module=Runtime", "support file")
+    reject_option(protoc, include, dest, "module=a,module=b", "Duplicate generator parameter")
     absent(dir ++ "/schema.bend")
+
+# Force the schema across multiple CodeGeneratorResponse.File records, then
+# import definitions from opposite ends of the reconstructed module.
+def declarations(+n: Nat) -> String:
+  match n:
+    case 0n: ""
+    case 1n+p: "message Row" ++ Nat.show(p) ++ " { uint32 x = 1; }\n" ++ declarations(p)
+
+def check_chunks(+bend: String, protoc: String, +fixtures: String, +dir: String) -> IO(Unit):
+  do IO<Unit>:
+    Host.write_text(fixtures ++ "/wide.proto", "syntax = \"proto3\";\n" ++ declarations(64n))
+    generate(protoc, "wirequill", fixtures, dir, ["wide.proto"])
+    +test_file : String = dir ++ "/chunk_check.bend"
+    Host.write_text(test_file, "import Base\nimport ./schema.bend as S\ndef main() -> Maybe<&2, S.PB_Row0>:\n  do Maybe<&2, S.PB_Row0>:\n    bytes : List<&2, U32> <- S.PB_Row63.encode(S.PB_Row63{42})\n    S.PB_Row0.decode(bytes)\n")
+    Host.command(bend, [test_file, "--check-only"])
+
+def compatibility(+bend: String, +protoc: String, +fixtures: String, +dir: String, executable: String) -> IO(Unit):
+  +plugin : String = "--plugin=build/protoc-gen-wirequill"
+  +include = "-I" ++ fixtures
+  +dest = "--wirequill_out=" ++ dir
+  do IO<Unit>:
+    Host.command(protoc, [plugin, include, dest, "--wirequill_opt=module=archive,preserve_unknown", "tree.proto"])
+    Host.command(protoc, [plugin, include, dest, "--wirequill_opt=module=catalog,preserve_unknown", "fixture.proto"])
+    absent(dir ++ "/schema.bend")
+    generated_test(bend, "tests/compat/roundtrip.bend", dir, executable, Nil{})
 
 def suite(+work: String) -> IO(Unit):
   +fixtures = work ++ "/fixtures"
   +tree = work ++ "/recursive"
   +grpc = work ++ "/grpc"
   +again = work ++ "/rpc-repeat"
+  +compat = work ++ "/compat"
   +errors = work ++ "/errors"
   do IO<Unit>:
     +bend : String <- Host.tool("BEND", "bend")
     +protoc : String <- Host.tool("PROTOC", "protoc")
-    Host.command("mkdir", [fixtures, work ++ "/messages", tree, grpc, again, errors])
+    Host.command("mkdir", [fixtures, work ++ "/messages", tree, grpc, again, errors, compat])
     Fixtures.write(fixtures)
+    Host.command(bend, ["tests/descriptors.bend"])
     Host.command(bend, ["tests/runtime.bend", "-o", work ++ "/runtime-test"])
     Host.command(work ++ "/runtime-test", Nil{})
     messages(bend, protoc, work, fixtures)
@@ -115,6 +148,8 @@ def suite(+work: String) -> IO(Unit):
     service_outputs(grpc, again)
     equal_files("grpc_runtime.bend", grpc ++ "/grpc_runtime.bend")
     generated_test(bend, "tests/grpc/roundtrip.bend", grpc, work ++ "/grpc-test", [work ++ "/echo.sock"])
+    compatibility(bend, protoc, fixtures, compat, work ++ "/compat-test")
+    check_chunks(bend, protoc, fixtures, compat)
     negative(protoc, fixtures, errors)
     IO.print("Protobuf interoperability, gRPC transport, and plugin error tests passed.")
 
